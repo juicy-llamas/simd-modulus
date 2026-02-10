@@ -1,13 +1,18 @@
 
+#include <bits/time.h>
 #include <emmintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+#include <xmmintrin.h>
 
 // std == 24
-#define LOOPS ((uint64_t)1 << 26)
-#define OUTLPS (1 << 6)
+#define LOOPS ((uint64_t)1 << 30)
+#define OUTLPS (1 << 5)
+
+#define BASEMASK 0x07FFFFFF
+#define YVALMASK 0x0FFFFFFF
 
 #include "mersene.c"
 
@@ -34,10 +39,9 @@ void __attribute__((noinline)) baseline ( int32_t* y, int32_t x ) {
   y[0] = y[0] % x;
 }
 
-const int intpow = 8;
+const int intpow = 3;
 const uint32_t cc = 1 << intpow;
 
-// accurate 99.9999% of the time (but not all the time) and 
 // faster than baseline
 void __attribute__((noinline)) simd1 ( int32_t* y, int32_t x ) {
   // c == 2^pow
@@ -107,7 +111,7 @@ void __attribute__((noinline)) simd2 ( int32_t* y, int32_t x ) {
   _mm_storeu_si128( (__m128i_u*)y, yyi );
 }
 
-// just a wee hair faster than simd2
+// made some of the fp ops into integer ops
 void __attribute__((noinline)) simd3 ( int32_t* y, int32_t x ) {
   // c == 2^pow
   float q = (float)cc / (float)x;
@@ -142,25 +146,60 @@ void __attribute__((noinline)) simd3 ( int32_t* y, int32_t x ) {
   _mm_storeu_si128( (__m128i_u*)y, yyi );
 }
 
-// huh
+// wait this actually just worked the whole time and just beats everything
+// but it's still inaccurate
 void __attribute__((noinline)) simd4 ( int32_t* y, int32_t x ) {
-  double q = (double)cc / (double)x;
   __m128 yy = _mm_set_ps( y[3], y[2], y[1], y[0] );
-  __m128 qq = _mm_set1_ps( q );
+  // it turns out this just works!
+  __m128 qq = _mm_set1_ps( 1.0f / x );
   // "integer divide" y by x
   qq = _mm_mul_ps( qq, yy );
-  _MM_SET_ROUNDING_MODE( _MM_ROUND_DOWN );
   __m128i qqi = _mm_cvtps_epi32( qq );
-  __m128 qr = _mm_cvtepi32_ps( qqi );
-  // get the "remainder fraction"
-  __m128 rm = _mm_sub_ps( qq, qr );
-  qqi = _mm_cvtps_epi32( rm );
-  qqi = _mm_srli_epi32( qqi, intpow );
-  rm = _mm_cvtepi32_ps( qqi );
-  // y *= "remainder fraction"
-  yy = _mm_mul_ps( yy, rm );
-  _MM_SET_ROUNDING_MODE( _MM_ROUND_NEAREST );
+  qq = _mm_cvtepi32_ps( qqi );
+
+  __m128 xx = _mm_set1_ps( x );
+  __m128 ml = _mm_mul_ps( qq, xx );
+  yy = _mm_sub_ps( yy, ml );
   __m128i yyi = _mm_cvtps_epi32( yy );
+  _mm_storeu_si128( (__m128i_u*)y, yyi );
+
+//  __m128  _k = _mm_set1_ps(1.0f / x);
+//  __m128  _p = _mm_set1_ps(x);
+//  __m128i _a = _mm_loadu_si128((__m128i*)(y));
+//  __m128  _e = _mm_mul_ps(_mm_cvtepi32_ps(_a), _k); // e = int(float(d)/float(p));
+//  __m128i _s = _mm_cvtps_epi32(_mm_mul_ps(_e, _p));
+//  __m128i _c = _mm_sub_epi32(_a, _s );
+//  _mm_storeu_si128((__m128i*)(y), _c);
+}
+
+// This is not completely, absolutely accurate (but is much, much more
+// accurate than the previous iterations), AND IT'S SLOWER.
+#define rv_elms (const int)((2 << 6) | (0 << 4) | (3 << 2) | (1 << 0))
+void __attribute__((noinline)) simd5 ( int32_t* y, int32_t x ) {
+  __m128i yyi = _mm_set_epi32( y[3], y[2], y[1], y[0] );
+  __m128i xxi = _mm_set1_epi32( x );
+  __m128 xx = _mm_set1_ps( 1.0f / x );
+  // this function has a tendency to overestimate the modulus,
+  // but we can do it twice.
+  for ( int i = 0; i < 2; i++ ) {
+    __m128 yy = _mm_cvtepi32_ps( yyi );
+    // divide y by x
+    __m128 qq = _mm_mul_ps( yy, xx );
+    // round
+    __m128i qqi = _mm_cvtps_epi32( qq );
+    // round(y/x) * x
+    __m128i tmp = _mm_mul_epu32( qqi, xxi );
+    qqi = _mm_srli_si128( qqi, 4 );
+    __m128i mli = _mm_srli_si128( xxi, 4 );
+    mli = _mm_mul_epu32( qqi, mli );
+    mli = _mm_slli_epi64( mli, 32 );
+    mli = _mm_add_epi32( tmp, mli );
+    // y = y - round(y/x)*x
+    yyi = _mm_sub_epi32( yyi, mli );
+  }
+  __m128i mask = _mm_cmplt_epi32( yyi, xxi );
+  xxi = _mm_andnot_si128( mask, xxi );
+  yyi = _mm_sub_epi32( yyi, xxi );
   _mm_storeu_si128( (__m128i_u*)y, yyi );
 }
 
@@ -173,8 +212,12 @@ int main () {
   bmem = malloc( LOOPS * 5 * sizeof( uint32_t ) );
   qmem = malloc( LOOPS * 4 * sizeof( uint32_t ) );
 
+  _MM_SET_ROUNDING_MODE( _MM_ROUND_DOWN );
+
   mt_state random_state;
   initialize_state( &random_state, 0xBEEFCACE );
+  //clock_gettime( CLOCK_REALTIME, &beg );
+  //initialize_state( &random_state, beg.tv_nsec );
   uint64_t k = 0;
   for ( ; k<<3 < LOOPS*5; k++ ) {
     const uint64_t kk = k << 3;
@@ -190,16 +233,18 @@ int main () {
   for ( k = k<<3; k < LOOPS*5; k++ )
     bmem[ k ] = random_uint32( &random_state );
   
+
   for ( int j = 0; j < OUTLPS; j++ ) {
-    int wrong = 0;
+    int wrong = 0, maxdist = 0, log = 1;
+    double avgdist = 0;
     int32_t y[4] __attribute__((aligned(16)));
     int32_t x;
     for ( uint64_t i = 0; i < LOOPS; i++ ) {
-      x = 3;//( bmem[5*i+0] & 0x0000FFFF ) + 1;
-      y[1] = bmem[5*i+1] & 0x007FFFFF;
-      y[2] = bmem[5*i+2] & 0x007FFFFF;
-      y[3] = bmem[5*i+3] & 0x007FFFFF;
-      y[0] = bmem[5*i+4] & 0x007FFFFF;
+      x = ( bmem[5*i+0] & BASEMASK ) + 1;
+      y[1] = bmem[5*i+1] & YVALMASK;
+      y[2] = bmem[5*i+2] & YVALMASK;
+      y[3] = bmem[5*i+3] & YVALMASK;
+      y[0] = bmem[5*i+4] & YVALMASK;
       qmem[ 4*i + 1 ] = y[1] % x;
       qmem[ 4*i + 2 ] = y[2] % x;
       qmem[ 4*i + 3 ] = y[3] % x;
@@ -207,14 +252,14 @@ int main () {
     }
     clock_gettime( CLOCK_MONOTONIC, &beg );
     // printf( "POW == %i\n", pow );
-    for ( uint64_t i = 0; i < LOOPS && wrong < 31; i++ ) {
-      x = 3;// ( bmem[5*i+0] & 0x0000FFFF ) + 1;
-      y[1] = bmem[5*i+1] & 0x007FFFFF;
-      y[2] = bmem[5*i+2] & 0x007FFFFF;
-      y[3] = bmem[5*i+3] & 0x007FFFFF;
-      y[0] = bmem[5*i+4] & 0x007FFFFF;
+    for ( uint64_t i = 0; i < LOOPS; i++ ) {
+      x = ( bmem[5*i+0] & BASEMASK ) + 1;
+      y[1] = bmem[5*i+1] & YVALMASK;
+      y[2] = bmem[5*i+2] & YVALMASK;
+      y[3] = bmem[5*i+3] & YVALMASK;
+      y[0] = bmem[5*i+4] & YVALMASK;
 
-      simd3( y, x );
+      simd5( y, x );
       //baseline( y, x );
       //no_op( y, qmem[4*i+1], qmem[4*i+2], qmem[4*i+3], qmem[4*i+0] );
 
@@ -232,21 +277,44 @@ int main () {
       if ( qmem[4*i+1] == y[1] && qmem[4*i+2] == y[2] && 
            qmem[4*i+3] == y[3] && qmem[4*i+0] == y[0] )
         continue;
-      if ( qmem[4*i+1] != y[1] ) {
-        printf( "OH NO! (0x%08X != 0x%08X) (i=%lu)\n", qmem[4*i+1], y[1], i );
-        wrong += 1;
-      }
-      if ( qmem[4*i+2] != y[2] ) {
-        printf( "OH NO! (0x%08X != 0x%08X) (i=%lu)\n", qmem[4*i+2], y[2], i );
-        wrong += 1;
-      }
-      if ( qmem[4*i+3] != y[3] ) {
-        printf( "OH NO! (0x%08X != 0x%08X) (i=%lu)\n", qmem[4*i+3], y[3], i );
-        wrong += 1;
-      }
-      if ( qmem[4*i+0] != y[0] ) {
-        printf( "OH NO! (0x%08X != 0x%08X) (i=%lu)\n", qmem[4*i+0], y[0], i );
-        wrong += 1;
+      else {
+        if ( qmem[4*i+1] != y[1] ) {
+          if ( log )
+            printf( "OH NO! (0x%08X != 0x%08X) (x=0x%08X) (y=0x%08X) "
+              "(i=%lu)\n", qmem[4*i+1], y[1], x, bmem[5*i+1] & YVALMASK, i );
+          wrong += 1;
+          int dist = abs( (int32_t)qmem[4*i+1] - y[1] );
+          maxdist = dist > maxdist ? dist : maxdist;
+          avgdist += dist;
+        }
+        if ( qmem[4*i+2] != y[2] ) {
+          if ( log )
+            printf( "OH NO! (0x%08X != 0x%08X) (x=0x%08X) (y=0x%08X) "
+              "(i=%lu)\n", qmem[4*i+2], y[2], x, bmem[5*i+2] & YVALMASK, i );
+          wrong += 1;
+          int dist = abs( (int32_t)qmem[4*i+2] - y[2] );
+          maxdist = dist > maxdist ? dist : maxdist;
+          avgdist += dist;
+        }
+        if ( qmem[4*i+3] != y[3] ) {
+          if ( log )
+            printf( "OH NO! (0x%08X != 0x%08X) (x=0x%08X) (y=0x%08X) "
+              "(i=%lu)\n", qmem[4*i+3], y[3], x, bmem[5*i+3] & YVALMASK, i );
+          wrong += 1;
+          int dist = abs( (int32_t)qmem[4*i+3] - y[3] );
+          maxdist = dist > maxdist ? dist : maxdist;
+          avgdist += dist;
+        }
+        if ( qmem[4*i+0] != y[0] ) {
+          if ( log )
+            printf( "OH NO! (0x%08X != 0x%08X) (x=0x%08X) (y=0x%08X) "
+              "(i=%lu)\n", qmem[4*i+0], y[0], x, bmem[5*i+0] & YVALMASK, i );
+          wrong += 1;
+          int dist = abs( (int32_t)qmem[4*i+0] - y[0] );
+          maxdist = dist > maxdist ? dist : maxdist;
+          avgdist += dist;
+        }
+        log = wrong < 32;
       }
     }
     clock_gettime( CLOCK_MONOTONIC, &end );
@@ -259,6 +327,9 @@ int main () {
       if ( mint > sec ) mint = sec;
       samples += 1;
     } else {
+      avgdist /= LOOPS;
+      printf( "WRONG TOTAL: %i\nAVG DIST: %f\nMAX DIST: %i\n",
+          wrong, avgdist, maxdist );
       break;
     }
   }
