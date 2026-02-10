@@ -8,11 +8,11 @@
 #include <xmmintrin.h>
 
 // std == 24
-#define LOOPS ((uint64_t)1 << 30)
+#define LOOPS ((uint64_t)1 << 27)
 #define OUTLPS (1 << 5)
 
-#define BASEMASK 0x07FFFFFF
-#define YVALMASK 0x0FFFFFFF
+#define BASEMASK 0x0000FFFF
+#define YVALMASK 0x00FFFFFF
 
 #include "mersene.c"
 
@@ -39,20 +39,16 @@ void __attribute__((noinline)) baseline ( int32_t* y, int32_t x ) {
   y[0] = y[0] % x;
 }
 
-const int intpow = 3;
-const uint32_t cc = 1 << intpow;
-
 // faster than baseline
 void __attribute__((noinline)) simd1 ( int32_t* y, int32_t x ) {
   // c == 2^pow
-  float q = (float)cc / (float)x;
+  float q = 1.0f / (float)x;
   __m128 yy = _mm_set_ps( y[3], y[2], y[1], y[0] );
   __m128 qq = _mm_set1_ps( q );
   // int32_t div = (unsigned)( (float)y * q );
   qq = _mm_mul_ps( qq, yy );
   // "integer divide" by shifting right pow
   __m128i qqi = _mm_cvtps_epi32( qq );
-  qqi = _mm_srli_epi32( qqi, intpow );
   qq = _mm_cvtepi32_ps( qqi );
   // int32_t ml = div * x;
   __m128 xx = _mm_set1_ps( x );
@@ -81,14 +77,13 @@ void __attribute__((noinline)) simd1 ( int32_t* y, int32_t x ) {
 // more optimized version of simd1
 void __attribute__((noinline)) simd2 ( int32_t* y, int32_t x ) {
   // c == 2^pow
-  float q = (float)cc / (float)x;
+  float q = 1.0f / (float)x;
   __m128 yy = _mm_set_ps( y[3], y[2], y[1], y[0] );
   __m128 qq = _mm_set1_ps( q );
   // int32_t div = (unsigned)( (float)y * q );
   qq = _mm_mul_ps( qq, yy );
   // "integer divide" by shifting right pow
   __m128i qqi = _mm_cvtps_epi32( qq );
-  qqi = _mm_srli_epi32( qqi, intpow );
   qq = _mm_cvtepi32_ps( qqi );
   // int32_t ml = div * x;
   __m128 xx = _mm_set1_ps( x );
@@ -114,7 +109,7 @@ void __attribute__((noinline)) simd2 ( int32_t* y, int32_t x ) {
 // made some of the fp ops into integer ops
 void __attribute__((noinline)) simd3 ( int32_t* y, int32_t x ) {
   // c == 2^pow
-  float q = (float)cc / (float)x;
+  float q = 1.0f / (float)x;
   __m128i yyi = _mm_set_epi32( y[3], y[2], y[1], y[0] );
   __m128 yy = _mm_cvtepi32_ps( yyi );
   __m128 qq = _mm_set1_ps( q );
@@ -122,7 +117,6 @@ void __attribute__((noinline)) simd3 ( int32_t* y, int32_t x ) {
   qq = _mm_mul_ps( qq, yy );
   // "integer divide" by shifting right pow
   __m128i qqi = _mm_cvtps_epi32( qq );
-  qqi = _mm_srli_epi32( qqi, intpow );
   qq = _mm_cvtepi32_ps( qqi );
   // int32_t ml = div * x;
   __m128i xxi = _mm_set1_epi32( x );
@@ -173,7 +167,7 @@ void __attribute__((noinline)) simd4 ( int32_t* y, int32_t x ) {
 }
 
 // This is not completely, absolutely accurate (but is much, much more
-// accurate than the previous iterations), AND IT'S SLOWER.
+// accurate than the previous iterations), AND IT'S SLOWER than baseline.
 #define rv_elms (const int)((2 << 6) | (0 << 4) | (3 << 2) | (1 << 0))
 void __attribute__((noinline)) simd5 ( int32_t* y, int32_t x ) {
   __m128i yyi = _mm_set_epi32( y[3], y[2], y[1], y[0] );
@@ -259,7 +253,7 @@ int main () {
       y[3] = bmem[5*i+3] & YVALMASK;
       y[0] = bmem[5*i+4] & YVALMASK;
 
-      simd5( y, x );
+      simd2( y, x );
       //baseline( y, x );
       //no_op( y, qmem[4*i+1], qmem[4*i+2], qmem[4*i+3], qmem[4*i+0] );
 
